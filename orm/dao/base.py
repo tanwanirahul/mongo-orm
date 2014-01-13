@@ -1,0 +1,511 @@
+'''
+Created on 20-Sep-2013
+
+@author: Rahul
+'''
+
+from bson.objectid import ObjectId
+from collections import OrderedDict
+from orm.utils import AttributeStyleDict
+from orm.exceptions import ValidationError, DoesNotExist, InvalidOperation
+#from tastypie.exceptions import BadRequest
+
+class BaseDAO(object):
+    
+    def __init__(self, datasource,auditlogger= None):
+        self.datasource = datasource
+        self.auditer = auditlogger
+
+    def audit_data_access(self,client):
+        pass
+        
+    def _get_spec(self,doc_id): 
+        if not type(doc_id) in (unicode,str,ObjectId):
+            raise TypeError("Id must be an instance of unicode, str, or ObjectId not %s" %(type (doc_id)))
+        if type(doc_id) in (ObjectId,):
+            return {"_id" : doc_id}
+        if ObjectId.is_valid(doc_id):
+            return {"_id" : ObjectId(doc_id)}
+        raise ValidationError
+
+    def _get_projection(self,fields):
+        return dict(map(lambda x: (x,1), fields))
+    
+    def _get_orderby(self,fields):
+        ORDER_TYPE_MAPP = {1 : 1,
+                           -1 : -1,
+                           "asc" : 1,
+                           "desc" : -1,
+                           }
+        def build_orderby(elem):
+            if type(elem) in (tuple,):
+                order_type = ORDER_TYPE_MAPP.get(elem[1], None)
+                if not order_type:
+                    raise ValueError("valid possible values for order type are : %s" %ORDER_TYPE_MAPP.keys())
+                return (elem[0],order_type)
+            elif type(elem) in (str,):
+                return(elem,1)
+            else:
+                raise ValueError("Invalid data for order fields")
+        return map(build_orderby, fields)
+
+
+class MongoDAO(BaseDAO):
+
+    #Injecting the datasource for this object. This may simply be a mongoDB collection.
+    def __init__(self, datasource,auditlogger= None):
+        super(MongoDAO,self).__init__(datasource,auditlogger)
+
+    def get_by_id(self,  doc_id, fields=[], **kwargs):
+        '''
+            A utility handy method to abstract wrapping resourceId into ObjectId for querying.
+        '''
+        projection = self._get_projection(fields)
+        spec = self._get_spec(doc_id)
+        if projection:
+            objects = self.datasource.find_one(spec, projection, **kwargs)
+        else:
+            objects = self.datasource.find_one(spec, **kwargs)
+        return self.post_process_for_get_by_id(objects)
+    
+    def batch_get_by_ids(self,  doc_ids=[], fields=[], **kwargs):
+        '''
+            This method should be used for batch gets. Given the list of Ids, this will return a cursor
+            pointing to all the required documents.
+        '''
+        wrap_in_object_id = lambda oid : ObjectId(oid)
+        projection = self._get_projection(fields)
+        ids = map(wrap_in_object_id,doc_ids)
+        spec = {"_id" : {"$in" : ids}}
+        if projection:
+            objects = self.datasource.find(spec, projection, **kwargs)
+        else:
+            objects = self.datasource.find(spec, **kwargs)
+        return objects
+
+    def get_one(self,  query={}, fields=[], **kwargs):
+        '''
+            This method will always return a single document that satisfies the query parameters.
+            optionally, client can request for specific subset of fields.
+            Other parameters will be passed as is, given in the kwargs. This include parameters such as,
+            skip,limit,timeout, etc.
+        ''' 
+        projection = self._get_projection(fields)
+        if projection:
+            return self.datasource.find_one(query, projection, **kwargs)
+        return self.datasource.find_one(query,**kwargs)
+
+    def get_all(self,  fields=[], orderby={}, **kwargs):
+        '''
+            This method returns a cursor object that holds the resultset of all documents.
+            optionally, client can request for specific subset of fields.
+            Do not accepts any query parameters to filter upon, this should be achieved by calling get_filtered instead.
+            This method though respects limit and skip parameters, along with orderby. 
+            orderby will accept a list of fields in the following way:
+            orderby = ["mrn", ("facilityId" , "desc"),"visitNumber"] 
+        '''
+        projection = self._get_projection(fields)
+        orderby = self._get_orderby(orderby)
+        spec = {"isDeleted" : {"$ne" : True}}
+        if projection:
+            return self.datasource.find(spec,projection,**kwargs).sort(orderby)
+        return self.datasource.find(spec,**kwargs).sort(orderby)
+
+
+    def get_filtered(self,  query={}, fields=[], orderby={}, **kwargs):
+        '''
+            This method returns a cursor object that holds the resultset of all filtered documents.
+            optionally, client can request for specific subset of fields.
+            This method respects limit and skip parameters.
+            orderby will accept a list of fields in the following way:
+            orderby = ["mrn", ("facilityId" , "desc"),"visitNumber"] 
+        '''
+        projection = self._get_projection(fields)
+        orderby = self._get_orderby(orderby) or [("_id", -1)]
+        spec = query
+        spec.update({"isDeleted" : {"$ne" : True}})
+        if projection:
+            return self.datasource.find(spec,projection,**kwargs).sort(orderby)
+        objects = self.datasource.find(spec,**kwargs).sort(orderby)
+        return self._post_process_get_filtered(objects)
+
+
+    def get_or_create(self,spec,**kwargs):
+        '''
+            A utility method that makes sure you always get a document you are looking for.
+            If one does not exists, it creates a one and returns the _id. 
+        '''
+        doc=self.get_one(query=spec,fields=["_id"],**kwargs)
+        if doc is None:
+            return self.insert(spec,**kwargs)
+        return {"_id" : str(doc["_id"])}
+
+
+    def get_id_from_spec(self,spec=None,document={},**kwargs):
+        '''
+            Always returns a _id for a spec. If one does not exists, creates one and returns.
+        '''
+        if spec is None:
+            spec = self.get_key_attributes(document)
+        return self.get_or_create( spec,**kwargs)
+
+
+    def count(self,query = {}):
+        '''
+            Returns a count of all the documents in the injected collection.
+            Does not yet support finding the count of documents for a resultset of a particular query.
+        '''
+        return self.datasource.find(query).count()
+
+    def insert(self,doc,**kwargs):
+        '''
+            Insert a document(s) into this collection.
+            Returns : The '_id' value of inserted document, or None if manipulate is False and the documents do not contains _id.
+        '''
+        doc = self._pre_process_insert(doc)
+        resp = self.datasource.insert(doc,**kwargs)
+        resp = {"_id" : str(resp)}
+        resp = self._post_process_insert(resp,doc)
+        return resp
+
+    def update(self,spec,document,**kwargs):
+        '''
+            Update a document(s) in this collection.
+            If spec fails to find any document and upsert is True, document will be inserted.
+            Returns : A document (dict) describing the effect of the update or None if write acknowledgment is disabled.
+        '''
+        return self.datasource.update(spec, document,**kwargs)
+
+    def update_fields(self,spec=None,document={},**kwargs):
+        '''
+            Update specific fields of document in this collection.
+            If spec fails to find any document and upsert is True, document will be inserted.
+            Returns : A document (dict) describing the effect of the update or None if write acknowledgment is disabled.
+        '''
+        document = self._pre_process_update_fields(document)
+        _id = self.get_id_from_spec(spec,document,**kwargs)
+        _id = _id.get("_id",None)
+        resp = self.datasource.update({"_id" : ObjectId(_id)}, {"$set" : document},**kwargs)
+        return self._formulate_response(resp,_id)
+    
+    def update_by_id(self,doc_id,document,**kwargs):
+        '''
+            A utility handy method to abstract wrapping resourceId into ObjectId for updating.
+            Returns: A document (Dict) describing the effect of the update or None if write acknowledgment is disabled.
+        '''
+        spec = self._get_spec(doc_id)
+        resp=self.datasource.update(spec, document,**kwargs)
+        return self._formulate_response(resp, _id=doc_id)
+    
+
+    def update_fields_by_id(self,doc_id,document,**kwargs):
+        '''
+            A utility handy method to abstract wrapping resourceId into ObjectId for updating.
+            Returns: A document (Dict) describing the effect of the update or None if write acknowledgment is disabled.
+        '''
+        spec = self._get_spec(doc_id)
+        document = self._pre_process_update_fields(document)
+        spec.update({"isDeleted" : {"$ne" : True}})
+        resp=self.datasource.update(spec, {"$set" : document},**kwargs)
+        if not resp.get("updatedExisting",False):
+            raise DoesNotExist("The object id specified does not exist")
+        return self._formulate_response(resp, _id=doc_id)
+    
+    def save(self,doc,**kwargs):
+        '''
+            Save a document in the injected collection.
+            If doc already has an "_id" then an update() (upsert) operation is performed and any existing document with that "_id" is overwritten. Otherwise an insert() operation is performed
+        '''
+        return self.datasource.save(doc)
+    
+    def remove(self,spec_or_id,**kwargs):
+        '''
+            Remove a document(s) from this collection.
+            If spec_or_id is None, all documents in this collection will be removed.
+            Returns: A document (dict) describing the effect of the remove or None if write acknowledgement is disabled.
+        '''
+        return self.datasource.remove(spec_or_id,**kwargs)
+        
+    
+    def remove_by_id(self,doc_id,**kwargs):
+        '''
+            A utility handy method to abstract wrapping resourceId into ObjectId for removing.
+            Returns: A document (dict) describing the effect of the remove or None if write acknowledgement is disabled.
+        '''
+        spec = self._get_spec(doc_id)
+        spec.update({"isDeleted" : {"$ne" : True}})
+        resp = self.datasource.update(spec,{"$set" : {"isDeleted" : True}},**kwargs)
+        if not resp.get("updatedExisting",False):
+            raise DoesNotExist("The object id specified does not exist")
+        return resp
+    
+    def distinct(self,field):
+        '''
+            Returns a list of distinct values for field among all documents in this collection.
+            Raises TypeError if field is not an instance of basestring.
+        '''
+        return self.datasource.distinct(field)
+    
+    def search(self, text):
+        '''
+            A place holder to implement free text search.
+            Not implemented yet, because haven't been used anywhere thus far.
+        '''
+        pass
+    
+    def raw_query(self,method,*args,**kwargs):
+        '''
+            A hook to provide flexibility to consumers, if any other method does not fulfill requirements.
+            Possible use cases could include having map-reduce and aggregation function calls. 
+        '''
+        mongo_method=getattr(self.datasource,method)
+        return mongo_method(*args,**kwargs)
+    
+    def aggregate(self,query,field):
+        '''
+            Returns the count of the documents for all the different values of the given field
+            Example:In beds if we have field as cleaningStatus
+                We will get the count of clean beds, cleaningInProgress beds, dirty beds and delayed beds
+        '''
+        result = self.datasource.aggregate([{ "$match" : query},{ "$group" : { "_id" : field , "count" : { "$sum" : 1}}}])
+        return result
+
+    def _post_process_get_filtered(self,objects):
+        objects_and_count = {"count":objects.count(),"objects" : list(objects)}
+        return objects_and_count
+    
+    def post_process_for_get_by_id(self,objects):
+        return objects
+    
+    def _formulate_response(self,resp,_id):
+        resp = resp or {}
+        resp.update({"_id" : str(_id)})
+        return resp
+    
+    def _merge(self,attribute,dataset,**kwargs):
+        update_params = {}
+        for key,value in dataset.items():
+            attr = "%s.%s" %(attribute,key)
+            update_params.update({attr : value})
+        return update_params
+    
+    def get_key_attributes(self,document):
+        raise  NotImplementedError
+    
+    def _pre_process_update_fields(self,document):
+        update_params = {}
+        for elem,value in document.items():
+            if type(value) in (dict,):
+                if value:
+                    update_params.update(self._merge(elem, value))
+                del document[elem]
+        update_params.update(document)
+        return update_params
+    
+    def _pre_process_insert(self,document):
+        return document
+    
+    def _post_process_insert(self,new_id,document):
+        return new_id
+
+
+class CollectionDoc(MongoDAO):
+
+    def __init__(self, datasource,auditlogger= None):
+        super(CollectionDoc,self).__init__(datasource,auditlogger)
+    
+    def _get(self, query, projection, **kwargs):
+        query.update({"isDeleted" : {"$ne" : True}})
+        if projection:
+            cursor = self.datasource.find(query, projection, **kwargs).sort([("_id" ,-1)]).limit(1)
+        else:
+            cursor=self.datasource.find(query,**kwargs).sort([("_id" ,-1)]).limit(1)
+        if cursor.count() > 0:
+            return cursor.next()
+        
+    def get_by_id(self,  doc_id, fields=[], **kwargs):
+        '''
+            A utility handy method to abstract wrapping resourceId into ObjectId for querying.
+        '''
+        projection = self._get_projection(fields)
+        spec = self._get_spec(doc_id)
+        objects = self._get(query=spec,projection=projection,**kwargs)
+        return self.post_process_for_get_by_id(objects)
+    
+    def get_one(self,  query={}, fields=[], **kwargs):
+        '''
+            This method will always return a single document that satisfies the query parameters.
+            optionally, client can request for specific subset of fields.
+            Other parameters will be passed as is, given in the kwargs. This include parameters such as,
+            skip,limit,timeout, etc.
+        ''' 
+        projection = self._get_projection(fields)
+        return self._get(query,projection,**kwargs)
+    
+    def get_all(self,  fields=[], orderby={}, **kwargs):
+        '''
+            This method returns a cursor object that holds the resultset of all documents.
+            optionally, client can request for specific subset of fields.
+            Do not accepts any query parameters to filter upon, this should be achieved by calling get_filtered instead.
+            This method though respects limit and skip parameters, along with orderby. 
+            orderby will accept a list of fields in the following way:
+            orderby = ["mrn", ("facilityId" , "desc"),"visitNumber"] 
+        '''
+        projection = self._get_projection(fields)
+        orderby = self._get_orderby(orderby) or [("_id",-1)]  
+        spec = {}
+        if projection:
+            return self.datasource.find(spec,projection,**kwargs).sort(orderby)
+        return self.datasource.find(spec,**kwargs).sort(orderby)
+    
+    def get_filtered(self, query={}, fields=[], orderby={}, **kwargs):
+        '''
+            This method returns a cursor object that holds the resultset of all filtered documents.
+            optionally, client can request for specific subset of fields.
+            This method respects limit and skip parameters.
+            orderby will accept a list of fields in the following way:
+            orderby = ["mrn", ("facilityId" , "desc"),"visitNumber"] 
+        '''
+        projection = self._get_projection(fields)
+        orderby = self._get_orderby(orderby) or [("_id",-1)]
+        spec = query
+        spec.update({"isDeleted" : {"$ne" : True}})
+        if projection:
+            objects = self.datasource.find(spec,projection,**kwargs).sort(orderby)
+        else:
+            objects = self.datasource.find(spec,**kwargs).sort(orderby)
+        return self._post_process_get_filtered(objects)
+
+
+class ListElement(MongoDAO):
+    #Injecting the data source for this object. This may simply be a mongoDB collection. + Audit logger + sub-resource field name.
+
+    def __init__(self, datasource,auditlogger= None,field=""):
+        super(ListElement, self).__init__(datasource,auditlogger)
+        self.field= field
+        
+    def _get_spec(self,doc_id): 
+        spec = super(ListElement,self)._get_spec(doc_id)
+        spec.update({self.field : {"$exists" : 1}})
+        return spec
+    
+    def get_one(self,  query={}, fields=[], **kwargs):
+        '''
+            Since this is supposed to be used for list fields, where single document can contain multiple values;
+            this operation is not yet supported.
+        '''
+        raise InvalidOperation
+    
+    def get_all(self,  encounterId, fields=[], orderby={}, **kwargs):
+        '''
+            This method returns a list of objects.
+            optionally, client can request for specific subset of fields.
+            Do not accepts any query parameters to filter upon, this should be achieved by calling get_filtered instead.
+        '''
+        projection = self._get_projection(fields)
+        projection.update({self.field : 1})
+        orderby = self._get_orderby(orderby) or [("_id",-1)]  
+        spec = self._get_spec(encounterId)
+        if projection:
+            docs = self.datasource.find(spec,projection,**kwargs).sort(orderby)
+        else:
+            docs = self.datasource.find(spec,**kwargs).sort(orderby)
+        return self._cursor_to_list_of_object(docs)
+    
+    def get_filtered(self, encounterId ,query={}, fields=[], orderby={}, **kwargs):
+        '''
+            This method returns a list of objects that holds all filtered documents.
+            optionally, client can request for specific fields from encounters itself and same will be added in response.
+            This method respects limit and skip parameters.
+        '''
+        unfiltered = self.get_all( encounterId, fields, orderby, **kwargs)
+        return unfiltered
+    
+    def _cursor_to_list_of_objects(self,docs):
+        results = []
+        for obj in docs:
+            dataset = obj[self.field] if type(obj[self.field]) in (list,) else obj[self.field].values()
+            for res in dataset:
+                if res is None:
+                    continue
+                res['encounterId'] = obj["_id"]
+                del obj["_id"]
+                del obj[self.field]
+                res.update(obj)
+                res['id']=""
+                results.append(AttributeStyleDict(res))
+                return results
+
+class DictElement(MongoDAO):
+    #Injecting the data source for this object. This may simply be a mongoDB collection.
+    def __init__(self, datasource,auditlogger= None,field=""):
+        super(DictElement, self).__init__(datasource,auditlogger)
+        self.field= field
+        
+    def _get_spec(self,doc_id): 
+        spec = super(DictElement,self)._get_spec(doc_id)
+        spec.update({self.field : {"$exists" : 1}})
+        return spec
+    
+    def get_one(self,  query={}, fields=[], **kwargs):
+        '''
+            There is no primary field based on which we return a single sub resource, if found multiple.
+            So, this operation is not yet implemented.
+        '''
+        raise InvalidOperation
+    
+    def get_all(self,  encounterId, fields=[], orderby={}, **kwargs):
+        '''
+            This method returns a Dict object.
+            optionally, client can request for specific subset of fields.
+            Do not accepts any query parameters to filter upon, this should be achieved by calling get_filtered instead.
+        '''
+        projection = self._get_projection(fields)
+        projection.update({self.field : 1})
+        orderby = self._get_orderby(orderby) or [("_id",-1)]  
+        spec = self._get_spec(encounterId)
+        if projection:
+            docs = self.datasource.find(spec,projection,**kwargs).sort(orderby)
+        else:
+            docs = self.datasource.find(spec,**kwargs).sort(orderby)
+        return self._cursor_to_objects(docs)
+    
+    def get_filtered(self, encounterId ,query={}, fields=[], orderby={}, **kwargs):
+        '''
+            This method returns an object, if all the query parameters are satisfied.
+        '''
+        unfiltered = self.get_all( encounterId, fields, orderby, **kwargs)
+        def apply_filters(obj):
+            for param,value in query.items():
+                if obj.get(param,None) != value: 
+                    return {}
+            return obj
+        return apply_filters(unfiltered)
+    
+    def _cursor_to_objects(self,docs):
+        required_doc = {}
+        if docs.count() > 0:
+            required_doc = docs.next()
+        return AttributeStyleDict(required_doc)
+
+class GridDAO(BaseDAO):
+    #Injecting the datasource(fs) for this object. This may simply be a object fetcher.
+    def __init__(self, fs):
+        self.fs = fs
+
+    def get(self, doc_id):
+        '''
+            A utility method for getting object from grid system
+        '''
+        return self.fs.get(ObjectId(doc_id))
+    
+    def save_file(self, file, filename):
+        return self.fs.put(file, filename = filename)
+    
+    def find(self, id):
+        return self.fs.exists(id)
+    
+    def delete_file(self, id):
+        doc_id = self._get_spec(id)
+        return self.fs.delete(doc_id)
+

@@ -1,0 +1,22 @@
+from restify.services.dao import DAOFactory
+from restify.services.models.services_register import Service
+from restify.services.models.dynamic_model import DynamicModel
+
+ACTIVITY_DAO = DAOFactory.get_dao_for_activities()
+
+class ModelFactory(object):
+    '''
+        Its a factory class for constructing and returning a Model for any data element.
+        The class offers a getModel factory method to get Model. 
+    '''
+    @classmethod
+    def getModel(cls,data_element):
+        '''
+            A class method that hides a complexity of constructing and getting access to a MODEL for a particular data element.
+            Accepts data_element for the same. Data_Element must be in the same format as specified in models.py 
+        '''
+        handler = getattr(cls, "get_model_for_{}".format(data_element),None)
+        if not handler:
+            NotImplemented("DAO for the specified data element is not yet implemented.")
+        return handler()   
+    

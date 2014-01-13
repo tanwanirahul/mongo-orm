@@ -1,0 +1,20 @@
+from base import MongoDAO
+class DAOFactory(object):
+    '''
+        Its a factory class for constructing and returning a Data Access Object (DAO) for any data element.
+        Every entity in our data schema is a data element, this include: patients,encounters,clinicalResults,allergies,guarantor etc.
+        To know about what all entities are available and supported, please checkout models.py.
+        The class offers a getDAO factory method to get DAO. 
+    '''
+
+    @classmethod
+    def getDAO(cls, data_element):
+        '''
+            A class method that hides a complexity of constructing and getting access to a DAO for a particular data element.
+            Accepts data_element for the same. Data_Element must be in the same format as specified in models.py 
+        '''
+        handler = getattr(cls, "get_dao_for_{}".format(data_element), None)
+        if not handler:
+            NotImplemented("DAO for the specified data element is not yet implemented.")
+        return handler()
+
